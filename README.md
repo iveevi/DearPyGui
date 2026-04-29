@@ -1,211 +1,117 @@
-<h1 align="center">
-  <br>
-  <a href="https://github.com/hoffstadt/DearPyGui"><img src="https://raw.githubusercontent.com/hoffstadt/DearPyGui/assets/readme/dpg_logo_button.png" alt="Dear PyGui logo"></a>
-</h1>
+# DearPyGui — external-GPU-memory fork
 
-<h4 align="center">A modern, fast and powerful GUI framework for Python</h4>
+This is a fork of [hoffstadt/DearPyGui](https://github.com/hoffstadt/DearPyGui)
+that adds **zero-copy texture interop** with external GPU APIs (Vulkan,
+slangpy, etc.) on the Linux/OpenGL backend.
 
-<h1></h1>
+Stock DearPyGui's only public texture API is `add_raw_texture`, which uploads
+a CPU buffer (`numpy` array) to GL each frame. That's a bandwidth ceiling: a
+1024² RGBA32F frame is 16 MB CPU→GPU per frame, plus a GPU→CPU readback if
+the producer is also on the GPU.
 
-<p align="center">
-  <a href=""><img src="https://img.shields.io/pypi/pyversions/dearpygui" alt="Python versions"></a>
-  <a href="https://pypi.org/project/dearpygui/"><img src="https://img.shields.io/pypi/v/dearpygui" alt="PYPI"></a>
-  <a href="https://pepy.tech/project/dearpygui"><img src="https://pepy.tech/badge/dearpygui" alt="Downloads"></a>
-  <a href="#license"><img src="https://github.com/hoffstadt/DearPyGui/blob/assets/readme/mit_badge.svg" alt="MIT License"></a>
-</p>
+This fork lets you skip the round-trip. A producer (e.g. slangpy) allocates a
+Vulkan image with `VK_KHR_external_memory_fd` and exports an opaque fd; you
+hand that fd to `add_raw_texture(..., external_memory_fd=...)` and DPG
+imports it via `GL_EXT_memory_object_fd`. The GL texture and the Vulkan
+storage image are now **the same physical GPU allocation** — the producer
+writes, ImGui samples, no copies.
 
-<p align="center">
-   <a href="https://github.com/hoffstadt/DearPyGui/actions?workflow=Embedded%20Build"><img src="https://github.com/hoffstadt/DearPyGui/actions/workflows/EmbeddedBuild.yml/badge.svg?branch=master" alt="static-analysis"></a>
-   <a href="https://github.com/hoffstadt/DearPyGui/actions?workflow=Static%20Analysis"><img src="https://github.com/hoffstadt/DearPyGui/actions/workflows/static-analysis.yml/badge.svg?branch=master" alt="static-analysis"></a>
-   <a href="https://github.com/hoffstadt/DearPyGui/actions/workflows/Deployment.yml"><img src="https://github.com/hoffstadt/DearPyGui/actions/workflows/Deployment.yml/badge.svg?branch=master" alt="Deployment"></a>
-   <a href="https://dearpygui.readthedocs.io/en/latest/?badge=latest"><img src="https://readthedocs.org/projects/dearpygui/badge/?version=latest" alt="Documentation Status"></a>
-</p>
+## What changed vs. upstream
 
-<h1></h1>
+- `mvRawTexture` accepts two new keyword args: `external_memory_fd` (int) and
+  `external_memory_size` (int, bytes). When `external_memory_fd >= 0`, the GL
+  texture is created once via `glImportMemoryFdEXT` + `glTexStorageMem2DEXT`
+  and the per-frame CPU upload path is skipped entirely.
+- New utility `LoadTextureFromExternalMemoryFd` in `mvUtilities_linux.cpp`.
+- Stubs on Windows/macOS (return `ImTextureID_Invalid`). The same idea ports
+  to D3D11 (`OpenSharedHandle`) and Metal (`IOSurface`); patches welcome.
 
-<p align="center">
-  <a href="#features">Features</a> •
-  <a href="#installation">Installation</a> •
-  <a href="#how-to-use">How To Use</a> • 
-  <a href="#demo">Demo</a> •
-  <a href="#resources">Resources</a> •
-  <a href="#support">Support</a> •
-  <a href="#tech-stack">Tech stack</a> •
-  <a href="#credits">Credits</a> •
-  <a href="#license">License</a> •
-  <a href="#gallery">Gallery</a>
-</p>
+Everything else is unchanged — existing `add_raw_texture` calls keep their
+old behavior.
 
-<h1></h1>
+## Requirements
 
-<BR>![Themes](https://raw.githubusercontent.com/hoffstadt/DearPyGui/assets/linuxthemes.PNG) 
-  
-## Features  
-- **Modern look** — Complete theme and style control
-- **Great performance** —  GPU-based rendering and efficient C/C++ code
-- **Stable operation** —  Asynchronous function support
-- **Fast graphs** — Display over 1 million datapoints at 60 fps, zoom and pan
-- **Node editor** — Intuitive user interaction
-- **Built-in demo** — Quickly learn all features
-- **Developer tools** — Theme and resource inspection, runtime metrics, debugger
-- **Cross-platform** — Windows, Linux, MacOS
-- **MIT license**
+- Linux with `GL_EXT_memory_object` and `GL_EXT_memory_object_fd` (Mesa,
+  recent NVIDIA).
+- A producer that exports opaque-fd handles (slangpy ≥ 0.41, raw Vulkan,
+  CUDA's `cudaExternalMemory`, etc.).
 
-<h1></h1>
-<p align="center">
-  <img src="https://raw.githubusercontent.com/wiki/epezent/implot/screenshots3/stem.gif" width="380">&nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp;<img src="https://raw.githubusercontent.com/wiki/epezent/implot/screenshots3/tables.gif" width="380">
-</p>
-<h1></h1>
+## Demo: rendering into DPG from slangpy with no copies
 
-<h1></h1>
-<p align="center"> 
-<img src="https://raw.githubusercontent.com/wiki/epezent/implot/screenshots3/pie.gif" width="380">&nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp;<img src="https://raw.githubusercontent.com/wiki/epezent/implot/screenshots3/candle.gif" width="380"> 
-</p>
-<h1></h1>
-  
-## Installation
-
-Ensure you have at least Python 3.8 64bit.
- ```
- pip install dearpygui
- or
- pip3 install dearpygui
- ```
- 
-## How to use?
- 
-Using Dear PyGui is as simple as the following Python script.
-  
-```Python
+```python
 import dearpygui.dearpygui as dpg
+import slangpy as spy
 
-def save_callback():
-    print("Save Clicked")
+W, H = 1024, 1024
 
-dpg.create_context()
-dpg.create_viewport()
-dpg.setup_dearpygui()
+# 1. slangpy makes a Vulkan storage image marked as exportable.
+device = spy.create_device(type=spy.DeviceType.vulkan, include_paths=["shaders"])
+texture = device.create_texture(
+    format=spy.Format.rgba8_unorm,
+    width=W, height=H,
+    usage=(spy.TextureUsage.unordered_access
+           | spy.TextureUsage.shader_resource
+           | spy.TextureUsage.shared),
+)
+fd = int(texture.shared_handle.value)            # opaque-fd from VK_KHR_external_memory_fd
+size_bytes = int(texture.memory_usage.device)    # driver-reported allocation size
 
-with dpg.window(label="Example Window"):
-    dpg.add_text("Hello world")
-    dpg.add_button(label="Save", callback=save_callback)
-    dpg.add_input_text(label="string")
-    dpg.add_slider_float(label="float")
+# 2. DPG imports the same memory as a GL texture.
+dpg.create_context(); dpg.create_viewport(width=W+32, height=H+80); dpg.setup_dearpygui()
+with dpg.texture_registry():
+    dpg.add_raw_texture(W, H, (),                          # default_value ignored
+                        format=dpg.mvFormat_Float_rgba,
+                        external_memory_fd=fd,
+                        external_memory_size=size_bytes,
+                        tag="shared_tex")
 
-dpg.show_viewport()
-dpg.start_dearpygui()
+with dpg.window(label="zero-copy", tag="w"):
+    dpg.add_image("shared_tex")
+dpg.set_primary_window("w", True); dpg.show_viewport()
+
+# 3. slangpy writes; DPG samples. Same memory.
+kernel = device.create_compute_kernel(device.load_program("render", ["main"]))
+import time; t0 = time.perf_counter()
+while dpg.is_dearpygui_running():
+    kernel.dispatch(thread_count=spy.uint3(W, H, 1),
+                    vars={"output": texture, "uniforms": {"resolution": spy.uint2(W, H),
+                                                          "time": time.perf_counter() - t0}})
+    device.wait_for_idle()              # CPU sync; replace with VK<->GL semaphores for max speed
+    dpg.render_dearpygui_frame()
 dpg.destroy_context()
 ```
-<br/>
-<p align="center"><a href="https://dearpygui.readthedocs.io/en/latest/tutorials/first-steps.html#first-run"><img src="https://raw.githubusercontent.com/hoffstadt/DearPyGui/assets/readme/first_app.gif" alt="Dear PyGui example window"></a></p>
-                                                                                           
-## Demo
-The built-in demo shows all of Dear PyGui's functionality. To run the demo, you can run:
+
+The companion `render.slang` here can be any compute shader writing
+`RWTexture2D<float4>` — see the `spy-imgui/` example repo.
+
+## Building
 
 ```bash
-python -m dearpygui.demo
+git clone --recursive <this fork>
+cd DearPyGui
+mkdir cmake-build-local && cd cmake-build-local
+cmake .. -DMVDIST_ONLY=True -DMVDPG_VERSION=2.3 -DMV_PY_VERSION=3.12 -DCMAKE_BUILD_TYPE=Release
+cmake --build . -j$(nproc)
+# drop the resulting _dearpygui.so over the one in your venv:
+cp DearPyGui/_dearpygui.so /path/to/venv/lib/python3.12/site-packages/dearpygui/
 ```
 
-Or you can use [this code](https://dearpygui.readthedocs.io/en/latest/tutorials/first-steps.html#demo) to run the demo. The following impression shows a few, but not nearly all, of the available widgets and features. Since the Python code of the demo can be <a href="https://github.com/hoffstadt/DearPyGui/blob/master/dearpygui/demo.py" alt="demo code repository">inspected</a>, you can leverage the demo code to build your own apps.
-<br/><br/>
-<p align="center"><a href="https://dearpygui.readthedocs.io/en/latest/tutorials/first-steps.html#demo"><img src="https://raw.githubusercontent.com/hoffstadt/DearPyGui/assets/readme/demo.gif" alt="Dear PyGui demo"></a></p>
-  
-## Resources
+## Caveats
 
-- [API documentation](https://dearpygui.readthedocs.io/en/latest/index.html) :books: 
-- [Development Roadmap](https://github.com/hoffstadt/DearPyGui/projects/4)
-- [FAQ](https://github.com/hoffstadt/DearPyGui/discussions/categories/frequently-asked-questions-faq)
-- [Feature Tracker](https://github.com/hoffstadt/DearPyGui/issues?q=is%3Aissue+is%3Aopen+label%3A%22type%3A+feature%22)
-- [Bug Tracker](https://github.com/hoffstadt/DearPyGui/issues?q=is%3Aissue+is%3Aopen+label%3A%22type%3A+bug%22)
-- [Useful code snippets demonstrating best practices](https://github.com/my1e5/dpg-examples)
-- [Showcase apps including source code](https://github.com/hoffstadt/DearPyGui/wiki/Dear-PyGui-Showcase) :star:
-- [Showcase apps made with older versions of Dear PyGui](https://github.com/hoffstadt/DearPyGui/wiki/Showcase-apps-older-Dear-PyGui-versions)
-- [Useful tools and widgets](https://github.com/hoffstadt/DearPyGui/wiki/Tools-and-Widgets)
-  
-## Support
-
-If you are having issues or want to help, here are some places you can go.
-  - [Discord Forum](https://discord.gg/tyE7Gu4) 💬
-  - [Reddit](https://www.reddit.com/r/DearPyGui/)
-
-[![Chat on Discord](https://img.shields.io/discord/736279277242417272?logo=discord)](https://discord.gg/tyE7Gu4) &nbsp; &nbsp; &nbsp; [![Reddit](https://img.shields.io/reddit/subreddit-subscribers/dearpygui?label=r%2Fdearpygui)](https://www.reddit.com/r/DearPyGui/)
-
-## Tech stack
-Dear PyGui is built on top of <a href="https://github.com/ocornut/imgui" target="_blank">Dear ImGui</a>, including the [ImPlot](https://github.com/epezent/implot) and [imnodes](https://github.com/Nelarius/imnodes) extensions, and is fundamentally different than other Python GUI frameworks. Under the hood, it uses the immediate mode paradigm and your computer's GPU to facilitate extremely dynamic interfaces. In the same manner Dear ImGui provides a simple way to create tools for game developers, Dear PyGui provides a simple way for python developers to create quick and powerful GUIs for scripts. Dear PyGui is written in C/C++ resulting in highly performant Python applications. Dear PyGui is currently supported on the following platforms. 
-<br/>
-  
-| Platform | Graphics API | Newest Version |
-|:---------|:-------------|:---------------|
-| **Windows 10** | _DirectX 11_ | [![PYPI](https://img.shields.io/pypi/v/dearpygui)](https://pypi.org/project/dearpygui/) |
-| **macOS** | _Metal_ | [![PYPI](https://img.shields.io/pypi/v/dearpygui)](https://pypi.org/project/dearpygui/) |
-| **Linux** | _OpenGL 3_ | [![PYPI](https://img.shields.io/pypi/v/dearpygui)](https://pypi.org/project/dearpygui/) |
-| **Raspberry Pi 4** | _OpenGL ES_ | [![PYPI](https://img.shields.io/badge/pypi-v1.6-blue)](https://img.shields.io/badge/pypi-v1.6-blue) |
-
-  
-## Credits
-
-- Developed by [Jonathan Hoffstadt](https://github.com/hoffstadt), [Preston Cothren](https://github.com/Pcothren) and every direct or indirect contributor.
-
-- [Omar Cornut](http://www.miracleworld.net/) for all his incredible work on [Dear ImGui](https://github.com/ocornut/imgui).
-
-- [Evan Pezent](http://evanpezent.com/) for all his work on [ImPlot](https://github.com/epezent/implot).
-
-- [Johann Muszynski](https://github.com/Nelarius) for all of his work on [imnodes](https://github.com/Nelarius/imnodes).
+1. **Sync is the user's job.** The example above CPU-syncs with
+   `device.wait_for_idle()`. For real performance use external semaphores —
+   slangpy exposes `Fence.shared_handle`, GL has `glGenSemaphoresEXT` /
+   `glWaitSemaphoreEXT`. Without that, the Vulkan queue stalls each frame.
+2. **Pass the driver-reported allocation size, not `W*H*bpp`.** Tiled images
+   get padded for alignment. With slangpy use
+   `texture.memory_usage.device` (Vulkan reports the same number via
+   `VkMemoryRequirements.size`). If you hit `GL_INVALID_VALUE` (`0x501`)
+   from `glTexStorageMem2DEXT`, that's what's wrong.
+3. **Format must match exactly.** The fork imports as `GL_RGBA8` (or
+   `GL_RGB8` for 3-component). Other formats need to be added to
+   `LoadTextureFromExternalMemoryFd`.
+4. **Linux/OpenGL only.** Windows and macOS fall back to a no-op stub.
 
 ## License
-Dear PyGui is licensed under the [MIT License](https://github.com/hoffstadt/DearPyGui/blob/master/LICENSE).
-  
-## Sponsor
-Continued maintenance and development are a full-time endeavor which we would like to sustain and grow. Ongoing development is financially supported by users and private sponsors. If you enjoy Dear PyGui please consider becoming a [sponsor](https://github.com/hoffstadt/DearPyGui/wiki/Sponsors) or buy us a [cup of coffee](https://www.buymeacoffee.com/DearPyGui).
 
-<img src="https://img.shields.io/github/sponsors/hoffstadt?label=Github%20Sponsors">&nbsp; &nbsp; &nbsp; <img src="https://img.shields.io/opencollective/sponsors/dearpygui?label=Open%20Collective%20Sponsors">
-
-## Gallery
-
-#### Plotting/Graphing
-_Dear PyGui_ includes a plotting API built with [ImPlot](https://github.com/epezent/implot)
-
-<img src="https://raw.githubusercontent.com/wiki/epezent/implot/screenshots3/controls.gif" width="380">&nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp;<img src="https://raw.githubusercontent.com/wiki/epezent/implot/screenshots3/dnd.gif" width="380">
-
-<img src="https://raw.githubusercontent.com/wiki/epezent/implot/screenshots3/query.gif" width="380">&nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp;<img src="https://raw.githubusercontent.com/wiki/epezent/implot/screenshots3/bars.gif" width="380">
-  
-<img src="https://raw.githubusercontent.com/wiki/epezent/implot/screenshots3/rt.gif" width="380">&nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp;<img src="https://raw.githubusercontent.com/wiki/epezent/implot/screenshots3/markers.gif" width="380">
-  
-<img src="https://raw.githubusercontent.com/wiki/epezent/implot/screenshots3/shaded.gif" width="380">&nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp;<img src="https://raw.githubusercontent.com/wiki/epezent/implot/screenshots3/heat.gif" width="380">
-
-
-#### Node Editor
-_Dear PyGui_ includes a node editor built with [imnodes](https://github.com/Nelarius/imnodes)
-![](https://github.com/hoffstadt/DearPyGui/blob/assets/readme/nodes2.png)
-
-
-#### Canvas
-_Dear PyGui_ includes a drawing API to create custom drawings, plot, and even 2D games.
-![](https://github.com/hoffstadt/DearPyGui/blob/assets/readme/tetris.png)
-
-
- ![](https://github.com/hoffstadt/DearPyGui/blob/assets/readme/3d.png)
- 
- ![](https://github.com/hoffstadt/DearPyGui/blob/assets/readme/nodes1.png)
- 
- ![](https://github.com/hoffstadt/DearPyGui/blob/assets/readme/space.png)
- 
- ![](https://github.com/hoffstadt/DearPyGui/blob/assets/readme/snake.gif)
- 
- ![](https://github.com/hoffstadt/DearPyGui/blob/assets/readme/drawing.png)
- 
- <BR>![BasicUsageExample](https://github.com/hoffstadt/DearPyGui/blob/assets/canvas.png?raw=true)
- 
- ![](https://github.com/hoffstadt/DearPyGui/blob/assets/readme/nodes3.png)
- 
- ![](https://github.com/hoffstadt/DearPyGui/blob/assets/readme/3d1.png)
- 
- ![](https://github.com/hoffstadt/DearPyGui/blob/assets/readme/game1.png)
- 
- ![](https://github.com/hoffstadt/DearPyGui/blob/assets/readme/mandlebrot.gif)
- 
- ![](https://github.com/hoffstadt/DearPyGui/blob/assets/readme/nodes4.png)
-
-## SAST Tools
-
-[PVS-Studio](https://pvs-studio.com/en/pvs-studio/?utm_source=website&utm_medium=github&utm_campaign=open_source) - static analyzer for C, C++, C#, and Java code.
+MIT, same as upstream.

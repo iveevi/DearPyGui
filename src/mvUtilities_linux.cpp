@@ -23,6 +23,50 @@
 
 static std::unordered_map<GLuint, GLuint> PBO_ids;
 
+// ---------------------------------------------------------------------------
+// External memory interop (GL_EXT_memory_object / GL_EXT_memory_object_fd)
+// gl3w doesn't load EXT_memory_object entry points, so we resolve them
+// lazily via glfwGetProcAddress.
+// ---------------------------------------------------------------------------
+
+#ifndef GL_HANDLE_TYPE_OPAQUE_FD_EXT
+#define GL_HANDLE_TYPE_OPAQUE_FD_EXT 0x9586
+#endif
+#ifndef GL_OPTIMAL_TILING_EXT
+#define GL_OPTIMAL_TILING_EXT 0x9584
+#endif
+#ifndef GL_LINEAR_TILING_EXT
+#define GL_LINEAR_TILING_EXT 0x9585
+#endif
+#ifndef GL_TEXTURE_TILING_EXT
+#define GL_TEXTURE_TILING_EXT 0x9580
+#endif
+
+typedef void (APIENTRY *PFN_glCreateMemoryObjectsEXT)(GLsizei, GLuint*);
+typedef void (APIENTRY *PFN_glDeleteMemoryObjectsEXT)(GLsizei, const GLuint*);
+typedef void (APIENTRY *PFN_glImportMemoryFdEXT)(GLuint, GLuint64, GLenum, GLint);
+typedef void (APIENTRY *PFN_glTexStorageMem2DEXT)(GLenum, GLsizei, GLenum, GLsizei, GLsizei, GLuint, GLuint64);
+
+static PFN_glCreateMemoryObjectsEXT  pfnCreateMemoryObjectsEXT  = nullptr;
+static PFN_glDeleteMemoryObjectsEXT  pfnDeleteMemoryObjectsEXT  = nullptr;
+static PFN_glImportMemoryFdEXT       pfnImportMemoryFdEXT       = nullptr;
+static PFN_glTexStorageMem2DEXT      pfnTexStorageMem2DEXT      = nullptr;
+static bool                          extMemoryObjectFdLoaded    = false;
+static bool                          extMemoryObjectFdAvailable = false;
+
+static bool LoadExtMemoryObjectFd()
+{
+    if (extMemoryObjectFdLoaded) return extMemoryObjectFdAvailable;
+    extMemoryObjectFdLoaded = true;
+    pfnCreateMemoryObjectsEXT = (PFN_glCreateMemoryObjectsEXT)glfwGetProcAddress("glCreateMemoryObjectsEXT");
+    pfnDeleteMemoryObjectsEXT = (PFN_glDeleteMemoryObjectsEXT)glfwGetProcAddress("glDeleteMemoryObjectsEXT");
+    pfnImportMemoryFdEXT      = (PFN_glImportMemoryFdEXT)glfwGetProcAddress("glImportMemoryFdEXT");
+    pfnTexStorageMem2DEXT     = (PFN_glTexStorageMem2DEXT)glfwGetProcAddress("glTexStorageMem2DEXT");
+    extMemoryObjectFdAvailable =
+        pfnCreateMemoryObjectsEXT && pfnImportMemoryFdEXT && pfnTexStorageMem2DEXT;
+    return extMemoryObjectFdAvailable;
+}
+
 static void
 UpdatePixels(GLubyte* dst, const float* data, int size)
 {
@@ -313,4 +357,48 @@ UpdateRawTexture(ImTextureID texture, unsigned width, unsigned height, float* da
     // it is good idea to release PBOs with ID 0 after use.
     // Once bound with 0, all pixel operations behave normal ways.
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+}
+
+ImTextureID
+LoadTextureFromExternalMemoryFd(unsigned width, unsigned height, int fd, unsigned long long size_in_bytes, int components)
+{
+    if (!LoadExtMemoryObjectFd())
+    {
+        fprintf(stderr, "[DPG] GL_EXT_memory_object_fd not available\n");
+        return ImTextureID_Invalid;
+    }
+    if (fd < 0 || size_in_bytes == 0)
+        return ImTextureID_Invalid;
+
+    // Drain prior GL errors so we can isolate ours.
+    while (glGetError() != GL_NO_ERROR) {}
+
+    GLuint memObj = 0;
+    pfnCreateMemoryObjectsEXT(1, &memObj);
+    pfnImportMemoryFdEXT(memObj, (GLuint64)size_in_bytes, GL_HANDLE_TYPE_OPAQUE_FD_EXT, fd);
+    GLenum err = glGetError();
+    if (err != GL_NO_ERROR)
+        fprintf(stderr, "[DPG] glImportMemoryFdEXT err=0x%x fd=%d size=%llu\n", err, fd, size_in_bytes);
+
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    // Match Vulkan VK_IMAGE_TILING_OPTIMAL (slangpy default).
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_TILING_EXT, GL_OPTIMAL_TILING_EXT);
+
+    GLenum internalFormat = (components == 4) ? GL_RGBA8 : GL_RGB8;
+    pfnTexStorageMem2DEXT(GL_TEXTURE_2D, 1, internalFormat,
+                          (GLsizei)width, (GLsizei)height, memObj, 0);
+    err = glGetError();
+    if (err != GL_NO_ERROR)
+        fprintf(stderr, "[DPG] glTexStorageMem2DEXT err=0x%x w=%u h=%u\n", err, width, height);
+
+    glBindTexture(GL_TEXTURE_2D, 0);
+    if (pfnDeleteMemoryObjectsEXT)
+        pfnDeleteMemoryObjectsEXT(1, &memObj);
+    return (ImTextureID)tex;
 }

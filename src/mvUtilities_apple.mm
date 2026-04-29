@@ -152,3 +152,10 @@ UpdateRawTexture(ImTextureID texture, unsigned width, unsigned height, float* da
     id <MTLTexture> out_srv = (__bridge id <MTLTexture>)texture;
     [out_srv replaceRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0 withBytes:data bytesPerRow:width * components * 4];
 }
+
+ImTextureID
+LoadTextureFromExternalMemoryFd(unsigned, unsigned, int, unsigned long long, int)
+{
+    // Not implemented on macOS. Use IOSurface / Metal shared events instead.
+    return ImTextureID_Invalid;
+}

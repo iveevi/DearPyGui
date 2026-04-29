@@ -454,3 +454,10 @@ UnloadTexture(const std::string& filename)
     // TODO : decide if cleanup is necessary
     return true;
 }
+
+ImTextureID
+LoadTextureFromExternalMemoryFd(unsigned, unsigned, int, unsigned long long, int)
+{
+    // Not implemented on Windows. Use D3D11/DXGI shared handles instead.
+    return ImTextureID_Invalid;
+}

@@ -95,6 +95,12 @@ public:
     int           _components = 4;
     int           _permWidth = 0;
     int           _permHeight = 0;
+    // External GPU memory backing (e.g. opaque-fd from Vulkan). When _externalFd
+    // >= 0, the texture is created once from imported GPU memory and the CPU
+    // upload path is skipped on every frame -- the producing API (slangpy etc.)
+    // writes directly into the same memory.
+    int           _externalFd = -1;
+    long long     _externalSize = 0;
 
 };
 

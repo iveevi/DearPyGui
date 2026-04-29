@@ -36,6 +36,13 @@ void  UpdateTexture(ImTextureID texture, u32 width, u32 height, std::vector<f32>
 ImTextureID LoadTextureFromArrayRaw(u32 width, u32 height, f32* data, i32 components);
 void  UpdateRawTexture(ImTextureID texture, u32 width, u32 height, f32* data, i32 components);
 
+// external GPU memory textures (Linux/OpenGL: GL_EXT_memory_object_fd)
+// Imports an external memory fd (e.g. an opaque-fd exported from Vulkan) and
+// creates a GL texture backed by that memory. The fd is consumed by the GL
+// driver. Returns ImTextureID_Invalid on unsupported platforms or extension
+// missing.
+ImTextureID LoadTextureFromExternalMemoryFd(u32 width, u32 height, i32 fd, unsigned long long size_in_bytes, i32 components);
+
 // framebuffer output
 void OutputFrameBuffer(const char* filepath);
 void OutputFrameBufferArray(PymvBuffer* out);

@@ -226,6 +226,27 @@ void mvRawTexture::setPyValue(PyObject* value)
 
 void mvRawTexture::draw(ImDrawList* drawlist, float x, float y)
 {
+	// External-memory path: create the GL texture once from the imported fd
+	// and never touch CPU data again. The producing API writes directly into
+	// the shared GPU memory between frames.
+	if (_externalFd >= 0)
+	{
+		if (_dirty)
+		{
+			_texture = LoadTextureFromExternalMemoryFd(
+				_permWidth, _permHeight, _externalFd,
+				(unsigned long long)_externalSize, _components);
+			if (_texture == ImTextureID_Invalid)
+			{
+				state.ok = false;
+				mvThrowPythonError(mvErrorCode::mvTextureNotFound, GetEntityCommand(type),
+					"Failed to import external memory fd. Check GL_EXT_memory_object_fd support.", this);
+			}
+			_dirty = false;
+		}
+		return;
+	}
+
 	if (_dirty)
 	{
 
@@ -281,6 +302,11 @@ void mvRawTexture::handleSpecificKeywordArgs(PyObject* dict)
 			_componentType = mvRawTexture::ComponentType::MV_FLOAT_COMPONENT;
 		}
 	}
+
+	if (PyObject* item = PyDict_GetItemString(dict, "external_memory_fd"))
+		_externalFd = ToInt(item);
+	if (PyObject* item = PyDict_GetItemString(dict, "external_memory_size"))
+		_externalSize = (long long)PyLong_AsLongLong(item);
 }
 
 void mvRawTexture::getSpecificConfiguration(PyObject* dict)
